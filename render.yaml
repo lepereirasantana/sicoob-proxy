@@ -1,1 +1,10 @@
-
+services:
+  - type: web
+    name: sicoob-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PROXY_API_KEY
+        sync: false
