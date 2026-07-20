@@ -1,18 +1,64 @@
 const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
+const forge = require('node-forge');
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY;
 const PORT = process.env.PORT || 3000;
 const MAX_BODY_SIZE = 10 * 1024 * 1024;
+
 const ALLOWED_DOMAINS = ['auth.sicoob.com.br', 'api.sicoob.com.br'];
 
 if (!PROXY_API_KEY) {
   console.error('PROXY_API_KEY não definida!');
 }
 
+function extractPfxCredentials(pfxBuffer, password) {
+  const asn1 = forge.asn1.fromDer(pfxBuffer.toString('binary'));
+  const p12 = forge.pkcs12.pkcs12FromAsn1(asn1, password);
+
+  let privateKey = null;
+  let keyLocalKeyId = null;
+  const certs = [];
+
+  for (const sc of p12.safeContents) {
+    if (!sc.safeBags) continue;
+    for (const bag of sc.safeBags) {
+      if ((bag.type === forge.pki.oids.keyBag || bag.type === forge.pki.oids.pkcs8ShroudedKeyBag) && bag.key) {
+        privateKey = forge.pki.privateKeyToPem(bag.key);
+        keyLocalKeyId = bag.attributes?.localKeyId?.[0] || null;
+      }
+      if (bag.type === forge.pki.oids.certBag && bag.cert) {
+        certs.push({
+          pem: forge.pki.certificateToPem(bag.cert),
+          localKeyId: bag.attributes?.localKeyId?.[0] || null,
+        });
+      }
+    }
+  }
+
+  if (!privateKey) throw new Error('Chave privada não encontrada no PFX');
+  if (certs.length === 0) throw new Error('Certificado não encontrado no PFX');
+
+  let clientCert = certs.find(c => c.localKeyId && keyLocalKeyId && c.localKeyId === keyLocalKeyId)?.pem;
+  if (!clientCert) clientCert = certs[0].pem;
+
+  const caChain = certs.filter(c => c.pem !== clientCert).map(c => c.pem);
+  const fullCert = caChain.length > 0 ? clientCert + '\n' + caChain.join('\n') : clientCert;
+
+  return { key: privateKey, cert: fullCert };
+}
+
 function makeMtlsRequest(url, method, headers, body, pfx, passphrase) {
   return new Promise((resolve, reject) => {
+    let tlsOptions;
+    try {
+      const creds = extractPfxCredentials(pfx, passphrase);
+      tlsOptions = { key: creds.key, cert: creds.cert };
+    } catch (err) {
+      return reject(new Error('Falha ao processar PFX: ' + err.message));
+    }
+
     const u = new URL(url);
     const options = {
       hostname: u.hostname,
@@ -20,11 +66,11 @@ function makeMtlsRequest(url, method, headers, body, pfx, passphrase) {
       path: u.pathname + u.search,
       method: method.toUpperCase(),
       headers: { ...headers, Connection: 'close' },
-      pfx,
-      passphrase,
+      ...tlsOptions,
       rejectUnauthorized: true,
       servername: u.hostname,
     };
+
     const req = https.request(options, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -38,6 +84,7 @@ function makeMtlsRequest(url, method, headers, body, pfx, passphrase) {
         });
       });
     });
+
     req.on('error', reject);
     req.setTimeout(30000, () => req.destroy(new Error('Timeout')));
     if (body) req.write(body);
@@ -58,48 +105,60 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
   }
+
   if (req.method !== 'POST' || req.url !== '/sicoob') {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Not found' }));
   }
+
   let body = '';
   let bodySize = 0;
   let tooLarge = false;
+
   for await (const chunk of req) {
     bodySize += chunk.length;
     if (bodySize > MAX_BODY_SIZE) { tooLarge = true; break; }
     body += chunk;
   }
+
   if (tooLarge) {
     res.writeHead(413, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Body too large' }));
   }
+
   let payload;
   try { payload = JSON.parse(body); }
   catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Invalid JSON' }));
   }
+
   if (!validateApiKey(payload.api_key)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Unauthorized' }));
   }
+
   const { pfx_base64, password, method, url, headers: reqHeaders, body: reqBody } = payload;
+
   if (!pfx_base64 || !password || !method || !url) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Missing required fields' }));
   }
+
   let parsedUrl;
   try { parsedUrl = new URL(url); }
   catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Invalid URL' }));
   }
+
   if (!ALLOWED_DOMAINS.includes(parsedUrl.hostname)) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Domain not allowed' }));
   }
+
   const pfx = Buffer.from(pfx_base64, 'base64');
+
   try {
     const result = await makeMtlsRequest(url, method, reqHeaders || {}, reqBody, pfx, password);
     res.writeHead(200, { 'Content-Type': 'application/json' });
